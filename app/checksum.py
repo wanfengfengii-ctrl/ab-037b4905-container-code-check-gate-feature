@@ -550,3 +550,188 @@ def reconcile_container_numbers(
         missing=tuple(missing),
         extra=tuple(extra),
     )
+
+
+# --------------------------------------------------------------- 多读数共识
+
+#: 共识结论中最多返回的最优解个数（按完整箱号字典序的前若干个）。
+CONSENSUS_MAX_SOLUTIONS = 100
+
+
+@dataclass(frozen=True)
+class ConsensusResult:
+    """多读数共识结论（不可变）。
+
+    * ``status``：``determined`` 唯一最优解（确定）、``ambiguous`` 多个
+      最优解（歧义）、``no_solution`` 无解；
+    * ``minimum_cost``：最优解对全部读数的逐位不一致总数；无解时为
+      ``None``；
+    * ``solution_count``：达到最小代价的最优解**总数**（精确计数，不受
+      返回上限影响）；
+    * ``solutions``：按完整箱号字典序排列的前若干个最优解（最多
+      :data:`CONSENSUS_MAX_SOLUTIONS` 个）；
+    * ``truncated``：最优解总数超过返回上限、列表被截断时为 ``True``。
+    """
+
+    status: Literal["determined", "ambiguous", "no_solution"]
+    minimum_cost: int | None
+    solution_count: int
+    solutions: tuple[str, ...]
+    truncated: bool
+
+
+def _position_candidate_counts(
+    readings: Sequence[str], position: int
+) -> dict[str, int]:
+    """统计某位置的候选域：实际出现且符合字符域的字符及其票数。
+
+    不符合该位置字符域的字符（如小写字母、占位符号）只会在代价中计为
+    不一致，一律不进入候选域；重复读数逐次计票。
+    """
+    allowed = set(_allowed_characters(position))
+    counts: dict[str, int] = {}
+    for reading in readings:
+        char = reading[position]
+        if char in allowed:
+            counts[char] = counts.get(char, 0) + 1
+    return counts
+
+
+def solve_consensus(
+    readings: Sequence[str],
+    max_solutions: int = CONSENSUS_MAX_SOLUTIONS,
+) -> ConsensusResult:
+    """在候选域组合空间内求校验位约束下代价最小的合法箱号（全局最优）。
+
+    每条读数必须恰为 11 位（契约层保证），原样使用，不做任何大小写或
+    空白归一化。求解口径：
+
+    * **候选域**：每个位置的候选字符为该位置实际出现且符合字符域的字
+      符；非法字符只计入不一致、不进入候选域；重复读数逐次计票。
+    * **代价**：候选箱号对全部读数的逐位不一致总数（等价于各位置
+      ``读数条数 - 该字符票数`` 之和）。
+    * **约束**：末位校验码必须等于前 10 位按本模块加权规则算出的期望
+      校验位（余数 10 折叠为 0）。
+
+    算法是按（位置, 加权和余数）的动态规划：先自右向左算出每个状态的
+    最小后缀代价与最优解数，再自左向右只沿能达到全局最小代价的分支
+    按字典序枚举前 ``max_solutions`` 个最优解。**不**先逐位取多数再
+    修补末位——逐位多数派可能违反校验位约束，其修补结果未必全局最优，
+    甚至可能不在候选域中。
+
+    两种无解均返回 ``no_solution``（代价为 ``None``）：任一位置无合法
+    观测（候选域为空），或候选域中不存在满足校验位的组合。
+    """
+    if not readings:
+        raise ValueError("readings must contain at least one reading")
+    for reading in readings:
+        if len(reading) != CONTAINER_LENGTH:
+            raise ValueError(
+                f"each reading must be exactly {CONTAINER_LENGTH} "
+                f"characters, got {len(reading)}"
+            )
+
+    reading_count = len(readings)
+    domains: list[dict[str, int]] = [
+        _position_candidate_counts(readings, position)
+        for position in range(CONTAINER_LENGTH)
+    ]
+    if any(not domain for domain in domains):
+        # 任一位置无合法观测：无解。
+        return ConsensusResult(
+            status="no_solution",
+            minimum_cost=None,
+            solution_count=0,
+            solutions=(),
+            truncated=False,
+        )
+
+    # 后缀 DP：suffix[position][remainder] = (最小代价, 最优解数)，表示
+    # 前 position 位加权和余数为 remainder 时，第 position..10 位（含
+    # 校验位）在候选域内能达到的最小代价及达到该代价的完整箱号个数。
+    # 第 10 位为校验位：余数唯一确定合法校验字符（余数 10 折叠为 0）。
+    check_position = CONTAINER_LENGTH - 1
+    check_domain = domains[check_position]
+    suffix: list[list[tuple[int, int] | None]] = [
+        [None] * MODULUS for _ in range(CONTAINER_LENGTH)
+    ]
+    for remainder in range(MODULUS):
+        digit_char = str(_check_digit_from_remainder(remainder))
+        votes = check_domain.get(digit_char)
+        if votes is not None:
+            suffix[check_position][remainder] = (reading_count - votes, 1)
+    for position in range(check_position - 1, -1, -1):
+        weight = 2 ** position
+        domain = domains[position]
+        for remainder in range(MODULUS):
+            best_cost: int | None = None
+            best_count = 0
+            for char, votes in domain.items():
+                nxt = (remainder + character_value(char) * weight) % MODULUS
+                tail = suffix[position + 1][nxt]
+                if tail is None:
+                    continue
+                cost = reading_count - votes + tail[0]
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_count = tail[1]
+                elif cost == best_cost:
+                    best_count += tail[1]
+            if best_cost is not None:
+                suffix[position][remainder] = (best_cost, best_count)
+
+    optimum = suffix[0][0]
+    if optimum is None:
+        # 候选域中不存在满足校验位的组合：无解。
+        return ConsensusResult(
+            status="no_solution",
+            minimum_cost=None,
+            solution_count=0,
+            solutions=(),
+            truncated=False,
+        )
+    minimum_cost, solution_count = optimum
+
+    # 自左向右按字典序枚举最优解：每个位置按字符升序尝试，只沿能达到
+    # 全局最小代价的分支前进（后缀 DP 表剪枝），集满 max_solutions 个即停。
+    solutions: list[str] = []
+    chosen: list[str] = []
+
+    def collect(position: int, remainder: int, cost_so_far: int) -> None:
+        if len(solutions) >= max_solutions:
+            return
+        if position == check_position:
+            digit_char = str(_check_digit_from_remainder(remainder))
+            votes = check_domain.get(digit_char)
+            if (
+                votes is not None
+                and cost_so_far + reading_count - votes == minimum_cost
+            ):
+                chosen.append(digit_char)
+                solutions.append("".join(chosen))
+                chosen.pop()
+            return
+        weight = 2 ** position
+        for char in sorted(domains[position]):
+            nxt = (remainder + character_value(char) * weight) % MODULUS
+            tail = suffix[position + 1][nxt]
+            if tail is None:
+                continue
+            next_cost = cost_so_far + reading_count - domains[position][char]
+            if next_cost + tail[0] != minimum_cost:
+                continue  # 该分支达不到全局最优，剪枝
+            chosen.append(char)
+            collect(position + 1, nxt, next_cost)
+            chosen.pop()
+            if len(solutions) >= max_solutions:
+                return
+
+    collect(0, 0, 0)
+
+    return ConsensusResult(
+        status="determined" if solution_count == 1 else "ambiguous",
+        minimum_cost=minimum_cost,
+        solution_count=solution_count,
+        solutions=tuple(solutions),
+        truncated=solution_count > len(solutions),
+    )

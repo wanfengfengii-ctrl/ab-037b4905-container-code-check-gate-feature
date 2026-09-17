@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import string
 from typing import Any
@@ -1240,3 +1241,287 @@ def test_reconcile_does_not_normalize_case_or_whitespace() -> None:
     assert body["list_source"] == "onsite"
     assert body["error_code"] == "invalid_length"
     assert body["position"] == 12
+
+
+# -------------------------------------------------------------- 多读数共识
+
+CONSENSUS_ENDPOINT = "/api/v1/container-numbers/consensus"
+
+# 多数派样例：三条 CSQU3054384（前 10 位期望校验位为 3，末位 4 不符）与
+# 两条 CSQU3054784（合法箱号）。逐位多数派得到非法的 CSQU3054384。
+MAJORITY_VIOLATING_READINGS = ["CSQU3054384"] * 3 + ["CSQU3054784"] * 2
+
+# 超过一百个同分最优的样例：两条读数 11 位全部不同，每个位置两个候选各
+# 一票，任何组合代价恒为 11，全部满足校验位的组合同分最优（独立参考
+# 确认共 294 个）。
+TIED_READINGS = ["TEUZ0258588", "YJIU3376050"]
+
+
+def _reference_consensus(readings: list[str]) -> dict[str, Any]:
+    """测试侧独立参考实现：暴力枚举候选域全部组合求全局最优。
+
+    与服务端"按（位置, 余数）的动态规划 + 剪枝枚举"的实现刻意不同。
+    """
+    domains: list[list[str]] = []
+    for position in range(11):
+        if position < 3:
+            allowed = set(string.ascii_uppercase)
+        elif position == 3:
+            allowed = set("UJZ")
+        else:
+            allowed = set(string.digits)
+        observed = {r[position] for r in readings if r[position] in allowed}
+        domains.append(sorted(observed))
+    if any(not domain for domain in domains):
+        return {
+            "status": "no_solution",
+            "minimum_cost": None,
+            "solution_count": 0,
+            "solutions": [],
+            "truncated": False,
+        }
+
+    best_cost: int | None = None
+    solutions: list[str] = []
+    for combo in itertools.product(*domains):
+        number = "".join(combo)
+        remainder = _reference_weighted_sum(number[:10]) % 11
+        expected = 0 if remainder == 10 else remainder
+        if expected != int(number[10]):
+            continue
+        cost = sum(
+            char != reading[position]
+            for reading in readings
+            for position, char in enumerate(combo)
+        )
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            solutions = [number]
+        elif cost == best_cost:
+            solutions.append(number)
+    if best_cost is None:
+        return {
+            "status": "no_solution",
+            "minimum_cost": None,
+            "solution_count": 0,
+            "solutions": [],
+            "truncated": False,
+        }
+    solutions.sort()
+    return {
+        "status": "determined" if len(solutions) == 1 else "ambiguous",
+        "minimum_cost": best_cost,
+        "solution_count": len(solutions),
+        "solutions": solutions[:100],
+        "truncated": len(solutions) > 100,
+    }
+
+
+def _consensus(readings: object) -> Any:
+    """以读数列表调用共识入口（允许传入任意形状用于 422 断言）。"""
+    return client.post(CONSENSUS_ENDPOINT, json={"readings": readings})
+
+
+def test_consensus_unique_solution_is_determined() -> None:
+    # 唯一共识：三条读数仅末位一处矛盾，合法箱号唯一。
+    response = _consensus(["CSQU3054383", "CSQU3054383", "CSQU3054384"])
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "determined",
+        "minimum_cost": 1,
+        "solution_count": 1,
+        "solutions": ["CSQU3054383"],
+        "truncated": False,
+    }
+
+
+def test_consensus_local_majority_violating_check_digit_loses() -> None:
+    # 局部多数违反校验位：逐位多数派 CSQU3054384 非法（期望 3 实际 4），
+    # "先取多数再修补末位"会得到 CSQU3054383，但 3 从未在末位观测中出现、
+    # 不在候选域内。全局最优必须偏离多数派第 9 位（3 -> 7）。
+    majority = "CSQU3054384"
+    assert _reference_weighted_sum(majority[:10]) % 11 == 3
+    assert "3" not in {r[10] for r in MAJORITY_VIOLATING_READINGS}
+
+    response = _consensus(MAJORITY_VIOLATING_READINGS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body == _reference_consensus(MAJORITY_VIOLATING_READINGS)
+    assert body["status"] == "determined"
+    assert body["solutions"] == ["CSQU3054784"]
+    assert body["minimum_cost"] == 3
+    # 返回的解是合法箱号（结构合法且校验位通过）。
+    winner = body["solutions"][0]
+    assert _reference_structure_ok(winner)
+    remainder = _reference_weighted_sum(winner[:10]) % 11
+    assert (0 if remainder == 10 else remainder) == int(winner[10])
+
+
+def test_consensus_ambiguous_optima_sorted_by_full_number() -> None:
+    # 歧义：两个合法箱号各观测一次，两个同分最优解按完整箱号字典序排列。
+    response = _consensus(["CSQU3054784", "CSQU3054383"])  # 输入乱序
+    assert response.status_code == 200
+    body = response.json()
+    assert body == _reference_consensus(["CSQU3054784", "CSQU3054383"])
+    assert body["status"] == "ambiguous"
+    assert body["minimum_cost"] == 2
+    assert body["solution_count"] == 2
+    assert body["solutions"] == ["CSQU3054383", "CSQU3054784"]
+    assert body["solutions"] == sorted(body["solutions"])
+    assert body["truncated"] is False
+
+
+def test_consensus_more_than_one_hundred_tied_optima_truncated() -> None:
+    # 超过一百个同分最优：精确计数 294，只返回字典序前一百个解并置截断标记。
+    response = _consensus(TIED_READINGS)
+    assert response.status_code == 200
+    body = response.json()
+    assert body == _reference_consensus(TIED_READINGS)
+    assert body["status"] == "ambiguous"
+    assert body["minimum_cost"] == 11
+    assert body["solution_count"] == 294  # 精确计数不受返回上限影响
+    assert len(body["solutions"]) == 100
+    assert body["truncated"] is True
+    assert body["solutions"] == sorted(body["solutions"])
+    # 每个返回的解对全部读数的逐位不一致总数都等于最小代价。
+    for solution in body["solutions"]:
+        assert (
+            sum(c != r[i] for r in TIED_READINGS for i, c in enumerate(solution))
+            == 11
+        )
+
+
+def test_consensus_no_legal_observation_at_position_is_no_solution() -> None:
+    # 无解边界一：位置 1 全部是小写（非法字符），该位置无合法观测。
+    response = _consensus(["csqu3054383", "csqu3054384"])
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "no_solution",
+        "minimum_cost": None,
+        "solution_count": 0,
+        "solutions": [],
+        "truncated": False,
+    }
+
+
+def test_consensus_no_combination_satisfies_check_digit_is_no_solution() -> None:
+    # 无解边界二：各位置候选域均非空，但末位候选 {4, 5} 都不等于期望
+    # 校验位 3，候选域中不存在满足校验位的组合。
+    response = _consensus(["CSQU3054384", "CSQU3054385"])
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "no_solution",
+        "minimum_cost": None,
+        "solution_count": 0,
+        "solutions": [],
+        "truncated": False,
+    }
+
+
+def test_consensus_illegal_characters_only_count_as_mismatches() -> None:
+    # 非法字符只计不一致、不进入候选域：第二条读数首位 '1' 不产生候选，
+    # 只在最小代价中贡献一次不一致。
+    response = _consensus(["CSQU3054383", "1SQU3054383", "CSQU3054383"])
+    assert response.status_code == 200
+    body = response.json()
+    assert body == _reference_consensus(["CSQU3054383", "1SQU3054383", "CSQU3054383"])
+    assert body["status"] == "determined"
+    assert body["solutions"] == ["CSQU3054383"]
+    assert body["minimum_cost"] == 1
+
+
+def test_consensus_duplicate_readings_vote() -> None:
+    # 重复读数逐次计票：同一对候选，票数多者胜出。
+    response = _consensus(["CSQU3054383", "CSQU3054784", "CSQU3054784"])
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "determined"
+    assert body["solutions"] == ["CSQU3054784"]
+    assert body["minimum_cost"] == 2
+
+    swapped = _consensus(["CSQU3054383", "CSQU3054383", "CSQU3054784"])
+    assert swapped.json()["solutions"] == ["CSQU3054383"]
+
+
+def test_consensus_boundary_sizes_two_and_one_hundred() -> None:
+    two = _consensus(["CSQU3054383", "CSQU3054383"])
+    assert two.status_code == 200
+    assert two.json()["solutions"] == ["CSQU3054383"]
+    assert two.json()["minimum_cost"] == 0
+
+    hundred = _consensus(["CSQU3054383"] * 100)
+    assert hundred.status_code == 200
+    assert hundred.json()["solutions"] == ["CSQU3054383"]
+    assert hundred.json()["minimum_cost"] == 0
+
+
+def test_consensus_request_shape_errors_are_422() -> None:
+    # 字段缺失、数量越界（少于 2 条 / 超过 100 条）、非字符串读数、
+    # 长度非十一位、多余字段：一律标准 422 detail。
+    missing = client.post(CONSENSUS_ENDPOINT, json={})
+    assert missing.status_code == 422
+    assert "detail" in missing.json()
+
+    too_few = _consensus(["CSQU3054383"])
+    assert too_few.status_code == 422
+    assert "detail" in too_few.json()
+
+    empty = _consensus([])
+    assert empty.status_code == 422
+    assert "detail" in empty.json()
+
+    too_many = _consensus(["CSQU3054383"] * 101)
+    assert too_many.status_code == 422
+    assert "detail" in too_many.json()
+
+    non_string = _consensus(["CSQU3054383", 12345678901])
+    assert non_string.status_code == 422
+    assert "detail" in non_string.json()
+
+    wrong_length = _consensus(["CSQU3054383", "CSQU305438"])
+    assert wrong_length.status_code == 422
+    assert "detail" in wrong_length.json()
+
+    too_long_reading = _consensus(["CSQU3054383", " CSQU3054383"])  # 12 位
+    assert too_long_reading.status_code == 422
+    assert "detail" in too_long_reading.json()
+
+    extra = client.post(
+        CONSENSUS_ENDPOINT,
+        json={"readings": ["CSQU3054383", "CSQU3054383"], "normalize": True},
+    )
+    assert extra.status_code == 422
+    assert "detail" in extra.json()
+
+
+def test_consensus_unpaired_surrogate_reading_counts_as_mismatch() -> None:
+    # 恰 11 位、首位为未配对代理字符的读数：不触发请求形状错误，代理字符
+    # 不属于任何字符域，只计一次不一致、不产生候选。
+    response = _post_raw_json(
+        CONSENSUS_ENDPOINT,
+        {"readings": ["\ud800SQU3054383", "CSQU3054383", "CSQU3054383"]},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "determined"
+    assert body["solutions"] == ["CSQU3054383"]
+    assert body["minimum_cost"] == 1
+
+
+def test_consensus_does_not_disturb_existing_endpoints() -> None:
+    # 引入共识入口后，原批量校验、纠错、明细、清单核对路径与响应保持不变。
+    verify = client.post(VALID_ENDPOINT, json={"container_numbers": [R_A, R_A_BAD]})
+    assert verify.status_code == 200
+    assert [r["passed"] for r in verify.json()["results"]] == [True, False]
+
+    correct = client.post(CORRECT_ENDPOINT, json={"container_number": "CSQX3054383"})
+    assert correct.status_code == 200
+    assert correct.json()["status"] == "unique"
+
+    explain = client.post(EXPLAIN_ENDPOINT, json={"container_number": R_A})
+    assert explain.status_code == 200
+    assert explain.json()["passed"] is True
+
+    reconcile = _reconcile([R_A], [R_A])
+    assert reconcile.status_code == 200
+    assert reconcile.json()["matched_count"] == 1

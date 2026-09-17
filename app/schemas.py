@@ -377,3 +377,73 @@ class ReconcileInvalidItemResponse(BaseModel):
     passed: Literal[False] = Field(
         ..., description="原校验结论：无效项恒为 false"
     )
+
+
+# ------------------------------------------------------------- 多读数共识
+
+#: 共识请求的读数条数下限（至少两条才存在需要裁决的矛盾读数）。
+MIN_READINGS = 2
+
+
+class ConsensusRequest(BaseModel):
+    """多读数共识请求：同一箱体的 2..100 条原始读数，原样使用。
+
+    读数不做任何大小写或空白归一化；每条必须恰为 11 个字符。读数中的
+    非法字符不使请求被拒绝——它们只会在共识代价中计为不一致。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 与单箱纠错相同的考虑：不用带长度约束的字符串项类型，避免
+    # pydantic-core 先做 Unicode 标量转换，把含未配对代理字符的合法
+    # 长度读数误判为请求形状错误（string_unicode）。恰为 11 位的检查
+    # 由下方 Python 校验器完成，错误形态仍是请求校验 422（detail 数组）。
+    readings: list[str] = Field(
+        ...,
+        min_length=MIN_READINGS,
+        max_length=MAX_BATCH,
+        description=(
+            f"同一箱体的原始读数列表（含端点 {MIN_READINGS} 至 {MAX_BATCH} 条）。"
+            "每条读数必须恰为 11 个字符，原样使用，不进行大小写或空白归一化；"
+            "重复读数逐次计票。"
+        ),
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _each_reading_exactly_eleven_characters(
+        cls, value: list[str]
+    ) -> list[str]:
+        for index, reading in enumerate(value):
+            if len(reading) != CONTAINER_LENGTH:
+                raise ValueError(
+                    f"reading at index {index} must be exactly "
+                    f"{CONTAINER_LENGTH} characters, got {len(reading)}"
+                )
+        return value
+
+
+class ConsensusResponse(BaseModel):
+    """多读数共识结论：校验位约束下代价最小的合法箱号。"""
+
+    status: Literal["determined", "ambiguous", "no_solution"] = Field(
+        ...,
+        description=(
+            "determined=唯一最优解（确定）；ambiguous=多个最优解（歧义）；"
+            "no_solution=无解"
+        ),
+    )
+    minimum_cost: int | None = Field(
+        ...,
+        description="最优解对全部读数的逐位不一致总数；无解时为 null",
+    )
+    solution_count: int = Field(
+        ..., description="达到最小代价的最优解总数（精确计数，不受返回上限影响）"
+    )
+    solutions: list[str] = Field(
+        ...,
+        description="按完整箱号字典序排列的前 100 个最优解（无解时为空列表）",
+    )
+    truncated: bool = Field(
+        ..., description="最优解总数超过 100、返回列表被截断时为 true"
+    )

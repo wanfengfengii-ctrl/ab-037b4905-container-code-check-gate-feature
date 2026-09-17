@@ -25,6 +25,7 @@ from app.checksum import (
     expected_check_digit,
     explain_check_digit,
     reconcile_container_numbers,
+    solve_consensus,
     split_container_number,
     structure_error,
     summarize_by_owner,
@@ -32,6 +33,8 @@ from app.checksum import (
 )
 from app.schemas import (
     ChecksumStepOut,
+    ConsensusRequest,
+    ConsensusResponse,
     ContainerPartsOut,
     ContainerResult,
     CorrectRequest,
@@ -346,4 +349,23 @@ def reconcile_container_lists(
             )
             for item in outcome.extra
         ],
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/consensus",
+    response_model=ConsensusResponse,
+    summary="雨污遮挡多读数共识：校验位约束下求全局最优合法箱号",
+)
+def consensus_container_numbers(request: ConsensusRequest) -> ConsensusResponse:
+    # 请求形状（2..100 条读数、每条恰 11 位、字段类型、无多余字段）由
+    # Pydantic 把关，不符即标准 422 detail；路由只编排领域求解与字段
+    # 映射，不参与候选构造、代价计算或解的枚举。
+    result = solve_consensus(request.readings)
+    return ConsensusResponse(
+        status=result.status,
+        minimum_cost=result.minimum_cost,
+        solution_count=result.solution_count,
+        solutions=list(result.solutions),
+        truncated=result.truncated,
     )
