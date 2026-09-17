@@ -1,0 +1,521 @@
+# 集装箱箱号批量校验 API（闸口放行前复算）
+
+纯后端服务：批量复算集装箱箱号的 ISO 6346 风格校验位，让闸口在放行前
+得到**可复算**的结论。手抄箱号错一位时，末位校验码对不上，服务会逐箱
+标出期望校验位、实际校验位与加权和；批量校验还可按开关附带**箱主汇总**，
+按箱主首次出现顺序给出每组总数、通过数与未通过数，供班组分配人工复核
+量；对未通过的箱号，还可提交单箱纠错入口，枚举"只差一个字符"的合法
+候选号；对校验结论有争议时，可提交单箱计算明细入口，逐字符还原映射值、
+权重与乘积的完整计算过程供现场复核。**换班交接**时还可使用一次性清单
+核对入口：当班作业清单（预期）与现场扫描清单各自先通过结构与校验位
+校验，再按完整箱号以重复次数逐次配对，直接给出已匹配项、预期中缺少项
+与现场多出项及其原索引，免去人工逐项比对。
+
+- 运行时：Python 3.12、FastAPI、Pydantic v2、Uvicorn
+- 无数据库、无外部依赖；字符映射与加权计算逻辑见 `app/checksum.py`
+- 常驻服务只有 API 一个；`verify` 是一次性验收任务（见文末）
+
+## 校验规则（逐字实现，不做任何归一化）
+
+每个箱号必须**恰为 11 个字符**，服务端不做大小写转换、不去除空白：
+
+| 位置 | 1–3 | 4 | 5–10 | 11 |
+| --- | --- | --- | --- | --- |
+| 含义 | 箱主代码 | 设备类别码 | 顺序号 | 校验数字 |
+| 取值 | 大写 `A-Z` | 仅 `U` / `J` / `Z` | 数字 `0-9` | 数字 `0-9` |
+
+前 10 位从左到右（位置 `i = 0..9`）计算：
+
+- 数字取原值 `0..9`；
+- 字母从 `A=10` 起递增，**跳过所有 11 的倍数**，因此
+  `B=12`、`K=21`、`L=23`（跳过 22）、`V=34`（跳过 33）、`Z=38`；
+- 各字符值乘以 `2**i` 求和，对 11 取余；
+- 余数为 `10` 时期望校验位为 `0`，其余余数即期望校验位。
+
+完整映射：
+
+```
+A10 B12 C13 D14 E15 F16 G17 H18 I19 J20 K21 L23 M24 N25 O26
+P27 Q28 R29 S30 T31 U32 V34 W35 X36 Y37 Z38
+```
+
+例：`CSQU3054383` 前 10 位加权和 `6185`，`6185 mod 11 = 3`，末位为 `3`，通过。
+
+## 运行
+
+### Docker Compose（只运行 API）
+
+```bash
+docker compose up --build
+# 自定义宿主端口（容器内固定 8000）：
+API_PORT=18080 docker compose up --build
+```
+
+- 健康检查：`GET http://localhost:${API_PORT:-8000}/health`
+- 交互文档：`http://localhost:8000/docs`
+
+### 本地直接运行
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## 请求示例
+
+端点：`POST /api/v1/container-numbers/verify`
+请求体：`{"container_numbers": [ ... ]}`，数组长度 **1 至 100**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "CSQU3054384"]}'
+```
+
+### 情形一：批次可解析（HTTP 200）——逐箱给结论
+
+结构全部合法即进入复算；校验位对不上属于**数据问题**而非请求无法解析，
+仍返回 200，由每箱 `passed` 表达：
+
+```json
+{
+  "status": "ok",
+  "count": 2,
+  "passed_count": 1,
+  "failed_count": 1,
+  "results": [
+    {
+      "index": 0,
+      "container_number": "CSQU3054383",
+      "parts": {
+        "owner_code": "CSQ",
+        "category_identifier": "U",
+        "serial_number": "305438",
+        "check_digit": "3"
+      },
+      "weighted_sum": 6185,
+      "expected_check_digit": 3,
+      "actual_check_digit": 3,
+      "passed": true
+    },
+    {
+      "index": 1,
+      "container_number": "CSQU3054384",
+      "parts": {
+        "owner_code": "CSQ",
+        "category_identifier": "U",
+        "serial_number": "305438",
+        "check_digit": "4"
+      },
+      "weighted_sum": 6185,
+      "expected_check_digit": 3,
+      "actual_check_digit": 4,
+      "passed": false
+    }
+  ]
+}
+```
+
+`weighted_sum` 与 `expected_check_digit` 可由调用方用上文规则原样复算。
+余数 10 折叠为 0 的边界样例：`AAAU000006` 加权和 `3398`，余 10，故合法
+箱号为 `AAAU0000060`。
+
+### 可选箱主汇总（`include_owner_summary`）
+
+请求体可携带可选开关 `"include_owner_summary": true`（只接受 JSON
+`true`/`false`，其他类型按请求校验返回 422 `detail`）。开关开启且整批
+结构合法时，响应在逐箱结论之外附带 `owner_summary`：服务复用每项已算出
+的箱主代码与通过结论，按**箱主首次出现顺序**给出每组总数、通过数与
+未通过数，重复箱主只形成一项，供班组按箱主分配人工复核量：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "AAAU0000060", "CSQU3054384"],
+       "include_owner_summary": true}'
+```
+
+```json
+{
+  "status": "ok",
+  "count": 3,
+  "passed_count": 2,
+  "failed_count": 1,
+  "results": [ "……逐项结论同上……" ],
+  "owner_summary": [
+    {"owner_code": "CSQ", "total": 2, "passed": 1, "failed": 1},
+    {"owner_code": "AAA", "total": 1, "passed": 1, "failed": 0}
+  ]
+}
+```
+
+开关**省略或为 `false`** 时，响应与不携带该开关的旧版请求**逐字段一致**
+（不出现 `owner_summary` 字段），原有客户端无需处理新字段。批内出现
+结构非法项时仍按最小输入索引返回 422 业务错误，且不产生汇总。
+
+### 情形二：批次无法解析（HTTP 422, `status=invalid_batch`）——整批拒绝
+
+批内**任一项**结构非法，即以其**最小输入索引**拒绝整批（不返回任何逐项
+结果），并指出该箱号内从左到右**首个损坏字符的位置**（位置从 1 起）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "csqu3054383"]}'
+```
+
+```json
+{
+  "status": "invalid_batch",
+  "count": 2,
+  "index": 1,
+  "container_number": "csqu3054383",
+  "error_code": "not_uppercase_letter",
+  "position": 1,
+  "message": "character at position 1 must be an uppercase letter A-Z (no case normalization is applied)"
+}
+```
+
+`error_code` 取值：
+
+- `invalid_length`：长度不是 11（含前导/尾随空白，绝不做 trim），
+  `position` 为越界位置；
+- `not_uppercase_letter`：前 3 位出现非大写字母；
+- `invalid_category_identifier`：第 4 位不是 `U/J/Z`；
+- `not_digit`：第 5–11 位出现非数字。
+
+### 请求形状错误（HTTP 422, Pydantic `detail`）
+
+空批、超过 100 项、字段缺失/类型错误/多余字段，返回 FastAPI 标准
+`{"detail": [...]}`，与上面的业务负载 `{"status": "invalid_batch", ...}`
+明确区分：
+
+```bash
+curl -s -X POST .../verify -H 'Content-Type: application/json' -d '{"container_numbers": []}'
+# {"detail":[{"type":"too_short", ... "min_length":1 ...}]}
+```
+
+## 单箱纠错建议（先校验，后纠错）
+
+闸口的典型用法是**先用批量接口筛出未通过项，再把其中一个箱号提交到
+纠错入口**，判断它是否只是一次单字符抄录偏差：
+
+```bash
+# 第一步：批量校验，筛出 passed=false 的箱号
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"container_numbers": ["CSQU3054383", "CSQU3054384"]}'
+# -> results[1].passed == false，取出 "CSQU3054384"
+
+# 第二步：对未通过项请求单字符纠错建议
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"container_number": "CSQU3054384"}'
+```
+
+端点：`POST /api/v1/container-numbers/correct`
+请求体：`{"container_number": "..."}`，**恰为 11 个字符**，原样使用，
+不做大小写或空白归一化（长度不符、字段类型错误、多余字段均按请求校验
+返回 422 `detail`）。
+
+服务枚举与原值**仅一位不同**（汉明距离恰为 1）且**结构合法、校验位
+通过**的全部候选，按（差异位置, 替换字符）稳定排序返回；原号自身与
+相差多位的号码一律不进入结果。合法请求即使没有候选也返回 200：
+
+```json
+{
+  "status": "multiple",
+  "container_number": "CSQU3054384",
+  "candidate_count": 12,
+  "candidates": [
+    {
+      "position": 1,
+      "original_character": "C",
+      "replacement_character": "D",
+      "container_number": "DSQU3054384"
+    },
+    {
+      "position": 11,
+      "original_character": "4",
+      "replacement_character": "3",
+      "container_number": "CSQU3054383"
+    }
+  ]
+}
+```
+
+（上例省略了中间 10 个候选；`position` 从 1 起计。）
+
+`status` 取值：
+
+- `unique`：唯一候选，可直接与原始单证核对；
+- `multiple`：多个候选（如上例），需人工结合箱主代码等线索取舍；
+- `not_found`：未找到任何单字符修复，偏差不止一处或不属于抄录错误。
+
+每个候选给出差异位置、原字符、新字符与完整候选号，候选生成复用与批量
+校验相同的字符映射、结构判定与校验位计算。
+
+## 单箱计算明细（争议时现场复核）
+
+当闸口人员对某只箱号的校验结论有争议时，调用方可从批量结果中取出该
+**结构合法**的箱号，提交到明细入口，把逐字符计算过程交给现场复核：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/explain \
+  -H 'Content-Type: application/json' \
+  -d '{"container_number": "CSQU3054383"}'
+```
+
+端点：`POST /api/v1/container-numbers/explain`
+请求体：`{"container_number": "..."}`，原样使用，不做大小写或空白
+归一化（字段缺失、类型错误、多余字段按请求校验返回 422 `detail`）。
+
+响应按原位置给出前 10 位每一位的字符、映射值、二次幂权重与乘积，
+并给出乘积合计、取模结果（未折叠的原始余数）、期望与实际校验位：
+
+```json
+{
+  "status": "ok",
+  "container_number": "CSQU3054383",
+  "steps": [
+    {"position": 1, "character": "C", "value": 13, "weight": 1, "product": 13},
+    {"position": 2, "character": "S", "value": 30, "weight": 2, "product": 60},
+    {"position": 10, "character": "8", "value": 8, "weight": 512, "product": 4096}
+  ],
+  "weighted_sum": 6185,
+  "remainder": 3,
+  "expected_check_digit": 3,
+  "actual_check_digit": 3,
+  "passed": true
+}
+```
+
+（上例省略了中间 7 个步骤；`position` 从 1 起计，`weight` 为
+`2**(position-1)`，`product = value * weight`。）
+
+`weighted_sum` 由 `steps` 的十项乘积求和得到，`remainder` 是合计对 11
+的原始余数（余数 10 时原样呈现为 10，折叠后的期望校验位为 0），
+`expected_check_digit` / `actual_check_digit` / `passed` 与批量校验结果
+同名字段永远一致——明细与校验共用同一份领域算法（不可变步骤对象），
+不存在两套各算各的口径。
+
+箱号结构损坏时返回 422 业务负载（`status=invalid_container`），沿用与
+批量校验相同的错误代码与首个损坏位置：
+
+```json
+{
+  "status": "invalid_container",
+  "container_number": "csqu3054383",
+  "error_code": "not_uppercase_letter",
+  "position": 1,
+  "message": "character at position 1 must be an uppercase letter A-Z (no case normalization is applied)"
+}
+```
+
+## 一次性清单核对（换班交接）
+
+闸口换班交接时，班组要确认**现场扫到的箱号**是否与**当班作业清单**
+一致。人工逐项比对容易漏掉重复箱（同一箱号扫了多次）或把重复次数数错，
+因此在批量校验等既有能力之外提供一次性清单核对入口，一次调用直接给出
+三类结果：
+
+端点：`POST /api/v1/container-numbers/reconcile`
+请求体：
+
+```json
+{
+  "expected_container_numbers": ["...当班作业清单..."],
+  "onsite_container_numbers": ["...现场扫描清单..."]
+}
+```
+
+两份清单各为 **1 至 100** 个箱号（沿用批量上限），字符串原样使用、不做
+任何归一化；数组顺序即原索引顺序。
+
+### 先校验，后配对
+
+服务**先按各自输入顺序**复用既有的结构判定（`structure_error`）与校验位
+计算（`expected_check_digit`）逐项检查：扫描顺序为先预期清单、后现场
+清单，清单内按索引从小到大。**任一**箱号结构非法或校验位不符即整次
+核对拒绝（见下），不产生任何配对结果；两份清单全部有效后，才按
+**完整箱号以重复次数逐次配对**：
+
+- 同一箱号的第 k 次出现，与另一侧的第 k 次出现配成一对；
+- 某侧出现次数多于另一侧时，**只有最后若干次**（按各自清单顺序）归入
+  差异——同一箱号出现三次而另一侧只有两次时，前两次配对，仅**最后一次**
+  成为缺少项或多出项；
+- 乱序不影响配对，配对依据是完整箱号与出现次序，而非数组下标。
+
+结果分三类，均携带在原清单中的索引（从 0 起）：
+
+- `matched`：已匹配项（箱号 + 两侧原索引），按**预期清单**顺序；
+- `missing`：预期中缺少项（现场未扫到对应次数），按**预期清单**顺序；
+- `extra`：现场多出项（预期无对应次数），按**现场清单**顺序。
+
+配对数量守恒：`matched_count + missing_count == expected_count`，
+`matched_count + extra_count == onsite_count`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/container-numbers/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_container_numbers": ["CSQU3054383", "AAAU0000060", "BBBU0000000"],
+       "onsite_container_numbers": ["ABCU1234560", "CSQU3054383", "AAAU0000060"]}'
+```
+
+上例现场缺少 `BBBU0000000`、多出 `ABCU1234560`：
+
+```json
+{
+  "status": "ok",
+  "expected_count": 3,
+  "onsite_count": 3,
+  "matched_count": 2,
+  "missing_count": 1,
+  "extra_count": 1,
+  "matched": [
+    {"container_number": "CSQU3054383", "expected_index": 0, "onsite_index": 1},
+    {"container_number": "AAAU0000060", "expected_index": 1, "onsite_index": 2}
+  ],
+  "missing": [
+    {"container_number": "BBBU0000000", "expected_index": 2}
+  ],
+  "extra": [
+    {"container_number": "ABCU1234560", "onsite_index": 0}
+  ]
+}
+```
+
+重复次数不等时，只有最后一次进入差异（预期 3 次 `CSQU3054383`、
+现场 2 次，仅预期索引 3 成为缺少项）：
+
+```json
+{
+  "status": "ok",
+  "expected_count": 4,
+  "onsite_count": 3,
+  "matched_count": 3,
+  "missing_count": 1,
+  "extra_count": 0,
+  "matched": [
+    {"container_number": "CSQU3054383", "expected_index": 0, "onsite_index": 0},
+    {"container_number": "AAAU0000060", "expected_index": 1, "onsite_index": 2},
+    {"container_number": "CSQU3054383", "expected_index": 2, "onsite_index": 1}
+  ],
+  "missing": [
+    {"container_number": "CSQU3054383", "expected_index": 3}
+  ],
+  "extra": []
+}
+```
+
+### 无效箱号拒绝（HTTP 422, `status=invalid_item`）
+
+任一清单含**结构非法或校验位不符**的箱号时整次核对拒绝，明确无效项的
+**清单来源**（`list_source` 为 `expected` / `onsite`）、在该清单中的
+**最小输入索引**（`index`，从 0 起）与**原校验结论**：
+
+- **结构非法**：`error_code` / `position` / `message` 给出与批量校验
+  `invalid_batch` 同口径的首个损坏位置与错误代码，
+  `expected_check_digit` / `actual_check_digit` 为 `null`（结构非法时
+  不做校验位复算）；
+- **校验位不符**：结构合法但末位校验码错误，三个结构字段为 `null`，
+  `expected_check_digit` / `actual_check_digit` 给出与批量校验逐项结论
+  同口径的期望与实际校验位。
+
+两种情形 `passed` 均为 `false`，且不返回 `matched` / `missing` /
+`extra`。定位顺序为先预期清单后现场清单（即便现场侧无效索引更小也先报
+预期侧），清单内取最小索引。
+
+```json
+{
+  "status": "invalid_item",
+  "expected_count": 1,
+  "onsite_count": 1,
+  "list_source": "onsite",
+  "index": 0,
+  "container_number": "CSQU3054384",
+  "error_code": null,
+  "position": null,
+  "message": null,
+  "expected_check_digit": 3,
+  "actual_check_digit": 4,
+  "passed": false
+}
+```
+
+### 请求形状错误（HTTP 422, Pydantic `detail`）
+
+任一清单为空、超过 100 项，或字段缺失 / 类型错误 / 多余字段，返回
+FastAPI 标准 `{"detail": [...]}`，与上面的业务负载
+`{"status": "invalid_item", ...}` 明确区分。
+
+## 未配对代理字符
+
+请求体 JSON 的 `\uXXXX` 转义可构造**未配对代理字符**（如首位为
+`\ud800` 的 11 位箱号）。服务对其不做任何特殊归一化，一律按普通
+非法字符处理：
+
+- 批量校验：整批拒绝，返回该箱号内首个损坏位置（首位代理字符即
+  位置 1，`error_code=not_uppercase_letter`）；
+- 计算明细：返回相同的 `invalid_container` 首位结构错误；
+- 单箱纠错：恰为 11 位时照常枚举候选并完整返回（位置 1 候选的
+  `original_character` 即该代理字符）。
+
+响应中的原样回显以 `\uXXXX` 转义形式传输，任何标准 JSON 解析器
+都能无损还原原字符串，回显语义与其他非法字符完全一致。
+
+## 测试
+
+字符映射跳号、加权位置敏感性、全部 11 种余数边界（含余 10→0、余 0→0）、
+结构首损定位、批量边界与两类 422 的区分均有覆盖；纠错入口以独立汉明
+距离枚举断言唯一候选、歧义候选、无候选及旧接口回归；明细入口以独立
+参考实现断言已知样例的十项乘积、余数十折零边界、结构错误定位，并逐箱
+确认明细合计与结论始终等于批量校验结果；箱主汇总以交错输入断言首次
+出现顺序与计数（测试侧整批重扫独立归组），并以旧请求快照锁定开关省略
+或为假时的逐字段兼容；清单核对以乱序及重复样例断言配对结果与独立
+"按出现次序对齐"参考逐字段一致、配对数量守恒（配对+缺少=预期总数、
+配对+多出=现场总数、原索引不重不漏），并覆盖完全一致、单侧缺失、
+重复次数不等（三次对两次时仅最后一次入差异）与非法箱号拒绝（来源、
+最小索引、结构/校验位两类原结论）四种场景：
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+## 一次性验收服务 `verify`
+
+`verify` 位于 `acceptance` profile 下，**不**随 `docker compose up` 常驻；
+镜像只由 `api` 构建一次，`verify` 按名称复用同一镜像（不重复声明 `build`，
+避免两个服务并行构建时争抢同一镜像标签）。它等 API 健康后用内置的独立
+参考实现（不复用被测代码）做端到端断言，打印每条 PASS/FAIL 并以退出码
+表达结果：
+
+```bash
+# 方式一：分别构建与运行
+docker compose build api
+docker compose --profile acceptance run --rm verify
+# 末尾输出 "ACCEPTANCE PASSED" 且退出码 0 即验收通过
+docker compose down
+
+# 方式二：一条命令完成构建、起服务、验收并按验收码退出
+docker compose --profile acceptance up --build \
+  --abort-on-container-exit --exit-code-from verify
+```
+
+## 目录结构
+
+```
+app/
+  checksum.py     # 字符映射、加权和、期望校验位、结构判定、纠错候选、计算明细、箱主汇总、清单核对（独立可测）
+  schemas.py      # Pydantic 请求/响应模型
+  main.py         # FastAPI 路由：整批结构校验 + 逐项复算 + 可选箱主汇总 + 单箱纠错 + 单箱明细 + 一次性清单核对
+tests/
+  test_checksum.py  # 映射跳号、余数边界、清单配对等单元测试
+  test_api.py       # API 端到端测试（含纠错、明细、箱主汇总、清单核对的独立参考断言）
+scripts/
+  acceptance.py     # verify 一次性验收脚本（仅用标准库）
+docker-compose.yml  # 仅 api 常驻；verify 为一次性任务
+Dockerfile
+```
