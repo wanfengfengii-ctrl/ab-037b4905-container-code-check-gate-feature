@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from app.checksum import (
     ReconcileInvalidItem,
+    consensus_container_numbers,
     correction_candidates,
     expected_check_digit,
     explain_check_digit,
@@ -32,6 +33,9 @@ from app.checksum import (
 )
 from app.schemas import (
     ChecksumStepOut,
+    ConsensusRequest,
+    ConsensusResponse,
+    ConsensusSolutionOut,
     ContainerPartsOut,
     ContainerResult,
     CorrectRequest,
@@ -345,5 +349,32 @@ def reconcile_container_lists(
                 onsite_index=item.onsite_index,
             )
             for item in outcome.extra
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/container-numbers/consensus",
+    response_model=ConsensusResponse,
+    summary="多读数共识：在矛盾的十一位读数中求最可信合法箱号",
+)
+def consensus_container_number(request: ConsensusRequest) -> ConsensusResponse:
+    # 请求形状（2..100 条、每条恰为 11 位字符串、无多余字段）由
+    # Pydantic 把关，不符即标准 422 detail；合法形状下领域层负责建
+    # 候选域、以逐位不一致总数为代价做校验位约束下的动态规划，并
+    # 确定/歧义/无解三类结论。路由仅编排领域求解与字段映射。
+    outcome = consensus_container_numbers(request.container_numbers)
+    return ConsensusResponse(
+        status=outcome.status,
+        reading_count=outcome.reading_count,
+        minimum_cost=outcome.minimum_cost,
+        solution_count=outcome.solution_count,
+        truncated=outcome.truncated,
+        solutions=[
+            ConsensusSolutionOut(
+                container_number=solution.container_number,
+                cost=solution.cost,
+            )
+            for solution in outcome.solutions
         ],
     )

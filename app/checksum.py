@@ -550,3 +550,237 @@ def reconcile_container_numbers(
         missing=tuple(missing),
         extra=tuple(extra),
     )
+
+
+# --------------------------------------------------------------- 多读数共识
+
+#: 共识入口接收的原始读数条数边界（含端点）。
+CONSENSUS_MIN_READINGS = 2
+CONSENSUS_MAX_READINGS = 100
+
+#: 响应中按完整箱号字典序返回的最优解上限。
+CONSENSUS_SOLUTION_LIMIT = 100
+
+#: 各 0 起计位置允许出现的字符全集（结构判定与候选域共用同一来源）。
+_POSITION_CHARACTER_SETS: tuple[frozenset[str], ...] = tuple(
+    frozenset(_allowed_characters(position))
+    for position in range(CONTAINER_LENGTH)
+)
+
+
+@dataclass(frozen=True)
+class ConsensusSolution:
+    """一个最优共识解：合法完整箱号及其对全部读数的逐位不一致总数。
+
+    进入结果的解均满足结构与校验位约束，且 ``cost`` 恒等于
+    :attr:`ConsensusResult.minimum_cost`（最优解代价彼此相同）。
+    """
+
+    container_number: str
+    cost: int
+
+
+@dataclass(frozen=True)
+class ConsensusResult:
+    """2..100 条矛盾读数的全局最优共识结论。
+
+    ``status``：
+
+    * ``unique``：恰有一个最优解（确定）；
+    * ``multiple``：有多个并列最优解（歧义）；
+    * ``not_found``：无可行解（某位置无合法观测，或候选域拼不出满足
+      校验位的组合），此时 ``minimum_cost`` 为 ``None``、
+      ``solution_count`` 为 0、``solutions`` 为空。
+
+    ``solution_count`` 是最优解的**精确总数**（可能超过 100）；
+    ``solutions`` 只承载按完整箱号字典序排列的前
+    :data:`CONSENSUS_SOLUTION_LIMIT` 个解，``truncated`` 标记是否被截断。
+    """
+
+    reading_count: int
+    status: Literal["unique", "multiple", "not_found"]
+    minimum_cost: int | None
+    solution_count: int
+    truncated: bool
+    solutions: tuple[ConsensusSolution, ...]
+
+
+def _no_consensus_result(reading_count: int) -> ConsensusResult:
+    """构造无可行解结论（代价为空、计数为 0、无截断）。"""
+    return ConsensusResult(
+        reading_count=reading_count,
+        status="not_found",
+        minimum_cost=None,
+        solution_count=0,
+        truncated=False,
+        solutions=(),
+    )
+
+
+def consensus_container_numbers(
+    readings: Sequence[str],
+) -> ConsensusResult:
+    """在多条相互矛盾的十一位读数中求最可信的合法箱号。
+
+    摄像头受雨污遮挡时同一箱体可能被识别成多份矛盾结果。本函数**不**
+    先逐位取多数再修补末位，而是：
+
+    1. **建候选域**：逐位置收集该位置上**实际出现且符合该位置字符域**
+       的字符（去重、升序）。非法字符（小写、越域字符、代理字符等）
+       只在代价中计一次不一致，永不进入候选域。重复读数按重复次数
+       参与计票。
+    2. **全局代价**：某候选完整箱号的代价为它对**全部**读数的逐位
+       不一致总数（每位 = 读数总数减去该候选字符在该位的出现次数；
+       非法观测因此恒为不一致）。
+    3. **动态规划**：以后缀 DP 在前 10 位的加权和对 11 余数
+       （0..10）状态上推进，末位（校验位）只接受由前缀余数唯一
+       折叠出的数字，从而在**校验位约束下**求全局最小代价与达到该
+       代价的**精确解数**。
+    4. **字典序枚举**：利用后缀最优代价剪枝，按每位置候选字符升序
+       DFS，前 :data:`CONSENSUS_SOLUTION_LIMIT` 个最优解天然按完整
+       箱号字典序产出。
+
+    无解有两类边界：任一位置没有任何合法观测（候选域为空）；候选域
+    非空但不存在满足校验位的组合。调用方须保证每条读数恰为 11 位
+    （由请求模型以标准 422 把关）。
+    """
+    reading_count = len(readings)
+    for reading in readings:
+        if len(reading) != CONTAINER_LENGTH:
+            raise ValueError(
+                f"container number must be exactly {CONTAINER_LENGTH} "
+                f"characters, got {len(reading)}"
+            )
+
+    # 逐位置合法字符的出现次数；非法字符不计入任何候选，故不会出现在
+    # 这张表里——它们在代价中自动落到“与任一候选都不一致”的一侧。
+    frequencies: list[dict[str, int]] = [
+        {} for _ in range(CONTAINER_LENGTH)
+    ]
+    for reading in readings:
+        for position, char in enumerate(reading):
+            if char in _POSITION_CHARACTER_SETS[position]:
+                frequencies[position][char] = (
+                    frequencies[position].get(char, 0) + 1
+                )
+
+    # 实际出现且合法的候选字符，升序排列：DFS 按此顺序枚举即得到完整
+    # 箱号的字典序（各位置字符域同质，ASCII 升序与箱号字典序一致）。
+    domains = [sorted(frequency) for frequency in frequencies]
+
+    # 边界一：任一位置没有任何合法观测，候选无法覆盖该位置。
+    if any(not domain for domain in domains):
+        return _no_consensus_result(reading_count)
+
+    check_frequency = frequencies[CONTAINER_LENGTH - 1]
+
+    def mismatch_cost(position: int, char: str) -> int:
+        """候选字符在该位置对全部读数的不一致数（含非法观测）。"""
+        return reading_count - frequencies[position][char]
+
+    # best_cost[i][r] / best_count[i][r]：已确定前 i 位、前缀加权和余数
+    # 为 r 时，第 i..10 位在候选域内且最终满足校验位的最小后缀代价，
+    # 以及达到该代价的不同后缀串数；不可行时代价为 INF、计数为 0。
+    inf = reading_count * CONTAINER_LENGTH + 1
+    best_cost = [
+        [inf] * MODULUS for _ in range(CONTAINER_LENGTH)
+    ]
+    best_count = [
+        [0] * MODULUS for _ in range(CONTAINER_LENGTH)
+    ]
+
+    # 末位（i=10）：合法校验数字由前缀余数唯一确定（余数 10 折叠为
+    # 0，余数 0 同样为 0），该数字未被观测到则此状态不可行。
+    for remainder in range(MODULUS):
+        required_digit = _check_digit_from_remainder(remainder)
+        char = str(required_digit)
+        if char in check_frequency:
+            best_cost[CONTAINER_LENGTH - 1][remainder] = mismatch_cost(
+                CONTAINER_LENGTH - 1, char
+            )
+            best_count[CONTAINER_LENGTH - 1][remainder] = 1
+
+    # 前 10 位：逐字符累加 value(char) * 2**position（模 11），在候选
+    # 转移上取最小后缀代价并对并列转移的后缀解数求和。不同候选字符
+    # 产生不同完整串，故解数直接相加即为精确总数。
+    for position in range(CONTAINER_LENGTH - 2, -1, -1):
+        weight = 2**position
+        for remainder in range(MODULUS):
+            chosen_cost = inf
+            chosen_count = 0
+            for char in domains[position]:
+                next_remainder = (
+                    remainder + character_value(char) * weight
+                ) % MODULUS
+                suffix_cost = best_cost[position + 1][next_remainder]
+                if suffix_cost == inf:
+                    continue
+                total_cost = mismatch_cost(position, char) + suffix_cost
+                suffix_count = best_count[position + 1][next_remainder]
+                if total_cost < chosen_cost:
+                    chosen_cost = total_cost
+                    chosen_count = suffix_count
+                elif total_cost == chosen_cost:
+                    chosen_count += suffix_count
+            best_cost[position][remainder] = chosen_cost
+            best_count[position][remainder] = chosen_count
+
+    minimum_cost = best_cost[0][0]
+
+    # 边界二：所有位置都有合法候选，但候选域内不存在满足校验位的组合。
+    if minimum_cost == inf:
+        return _no_consensus_result(reading_count)
+
+    solution_count = best_count[0][0]
+
+    # 按字典序枚举前 LIMIT 个最优解：每位置候选已升序，DFS 本身即字典
+    # 序；后缀最优代价剪枝保证只走能达到全局最小的转移，到达 100 个即
+    # 停止，候选空间再大也不会全量遍历。
+    chosen_chars: list[str] = []
+    optimal_numbers: list[str] = []
+
+    def enumerate_optimal(position: int, remainder: int, spent: int) -> None:
+        if len(optimal_numbers) >= CONSENSUS_SOLUTION_LIMIT:
+            return
+        if position == CONTAINER_LENGTH - 1:
+            required_digit = _check_digit_from_remainder(remainder)
+            char = str(required_digit)
+            if (
+                char in check_frequency
+                and spent + mismatch_cost(position, char) == minimum_cost
+            ):
+                optimal_numbers.append("".join(chosen_chars) + char)
+            return
+        weight = 2**position
+        for char in domains[position]:
+            next_remainder = (
+                remainder + character_value(char) * weight
+            ) % MODULUS
+            suffix_cost = best_cost[position + 1][next_remainder]
+            cost = mismatch_cost(position, char)
+            if (
+                suffix_cost != inf
+                and spent + cost + suffix_cost == minimum_cost
+            ):
+                chosen_chars.append(char)
+                enumerate_optimal(
+                    position + 1, next_remainder, spent + cost
+                )
+                chosen_chars.pop()
+            if len(optimal_numbers) >= CONSENSUS_SOLUTION_LIMIT:
+                return
+
+    enumerate_optimal(0, 0, 0)
+
+    solutions = tuple(
+        ConsensusSolution(container_number=number, cost=minimum_cost)
+        for number in optimal_numbers
+    )
+    return ConsensusResult(
+        reading_count=reading_count,
+        status="unique" if solution_count == 1 else "multiple",
+        minimum_cost=minimum_cost,
+        solution_count=solution_count,
+        truncated=solution_count > len(optimal_numbers),
+        solutions=solutions,
+    )

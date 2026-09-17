@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import string
@@ -24,6 +25,7 @@ ENDPOINT = "/api/v1/container-numbers/verify"
 CORRECT_ENDPOINT = "/api/v1/container-numbers/correct"
 EXPLAIN_ENDPOINT = "/api/v1/container-numbers/explain"
 RECONCILE_ENDPOINT = "/api/v1/container-numbers/reconcile"
+CONSENSUS_ENDPOINT = "/api/v1/container-numbers/consensus"
 
 
 # --------------------------------------------------------------- 参考实现
@@ -166,6 +168,49 @@ def reference_reconcile(expected: list[str], onsite: list[str]) -> dict:
     return {"matched": matched, "missing": missing, "extra": extra}
 
 
+def reference_consensus(readings: list[str]) -> tuple[int, list[str]] | None:
+    """多读数共识的独立暴力参考：逐位置取实际出现且合法的字符为候选
+    域，笛卡尔积枚举，独立结构与校验位筛选，对全部读数求汉明距离
+    之和取最小。返回 (最小代价, 全部最优解字典序)；任一位置无合法
+    观测或候选域拼不出满足校验位的组合时返回 None。与服务端 DP
+    实现刻意不同（不做余数状态递推与剪枝）。
+    """
+    domains: list[list[str]] = []
+    for position in range(11):
+        if position < 3:
+            allowed = set(string.ascii_uppercase)
+        elif position == 3:
+            allowed = set("UJZ")
+        else:
+            allowed = set(string.digits)
+        domain = sorted({reading[position] for reading in readings} & allowed)
+        if not domain:
+            return None
+        domains.append(domain)
+
+    minimum_cost: int | None = None
+    optimal: list[str] = []
+    for combo in itertools.product(*domains):
+        number = "".join(combo)
+        if not reference_structure_ok(number):
+            continue
+        _, check = reference_check_digit(number[:10])
+        if check != int(number[10]):
+            continue
+        cost = sum(
+            char != reading[position]
+            for reading in readings
+            for position, char in enumerate(number)
+        )
+        if minimum_cost is None or cost < minimum_cost:
+            minimum_cost, optimal = cost, [number]
+        elif cost == minimum_cost:
+            optimal.append(number)
+    if minimum_cost is None:
+        return None
+    return minimum_cost, sorted(optimal)
+
+
 # ----------------------------------------------------------------- HTTP
 
 
@@ -249,6 +294,26 @@ def call_reconcile(
             "onsite_container_numbers": onsite,
         }
     )
+
+
+def call_consensus_payload(payload: object) -> tuple[int, object]:
+    """以任意 JSON 负载调用多读数共识入口（用于形状断言）。"""
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        BASE_URL + CONSENSUS_ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def call_consensus(readings: object) -> tuple[int, object]:
+    return call_consensus_payload({"container_numbers": readings})
 
 
 def get_health() -> tuple[int, object]:
@@ -1027,6 +1092,198 @@ def run() -> int:
     status, body = call_explain("CSQU3054383")
     checks.expect("35g 明细入口仍 200", status, 200)
     checks.expect("35h 明细结论仍 passed", body["passed"], True)
+
+    # ============================================ 多读数共识（雨污遮挡）
+    def assert_consensus_equals_reference(
+        prefix: str, body: dict, readings: list
+    ) -> None:
+        """共识响应与独立暴力参考逐字段一致：状态、最小代价、精确
+        解数、截断标记、字典序前 100 解。"""
+        reference = reference_consensus(readings)
+        if reference is None:
+            checks.expect(f"{prefix}a 无解状态", body["status"], "not_found")
+            checks.expect(f"{prefix}b 无解代价为空", body["minimum_cost"], None)
+            checks.expect(f"{prefix}c 无解解数 0", body["solution_count"], 0)
+            checks.expect(f"{prefix}d 无解不截断", body["truncated"], False)
+            checks.expect(f"{prefix}e 无解列表空", body["solutions"], [])
+            return
+        minimum_cost, optimal = reference
+        checks.expect(
+            f"{prefix}a 状态",
+            body["status"],
+            "unique" if len(optimal) == 1 else "multiple",
+        )
+        checks.expect(f"{prefix}b 最小代价", body["minimum_cost"], minimum_cost)
+        checks.expect(f"{prefix}c 精确解数", body["solution_count"], len(optimal))
+        checks.expect(
+            f"{prefix}d 截断标记",
+            body["truncated"],
+            len(optimal) > 100,
+        )
+        checks.expect(
+            f"{prefix}e 字典序前100解",
+            body["solutions"],
+            [
+                {"container_number": n, "cost": minimum_cost}
+                for n in optimal[:100]
+            ],
+        )
+
+    # 36. 唯一共识：完全一致的两条读数，代价 0。
+    readings = ["CSQU3054383", "CSQU3054383"]
+    status, body = call_consensus(readings)
+    checks.expect("36a 唯一共识 200", status, 200)
+    checks.expect("36b 读数计数", body["reading_count"], 2)
+    assert_consensus_equals_reference("36c", body, readings)
+    checks.expect("36d 零代价", body["minimum_cost"], 0)
+
+    # 37. 局部多数违反校验位：不得先逐位多数再修补末位，必须全局最优。
+    # 逐位多数（含末位）合成 CSQU3054384 —— 期望末位 3，校验位不符；
+    # 全局最优保留 5 条 D 系读数的首位 D，得 DSQU3054384（合法）。
+    readings = (
+        ["CSQU3054383"] * 3
+        + ["DSQU3054384"] * 5
+        + ["CSQU3054384"] * 4
+    )
+    _, greedy_check = reference_check_digit("CSQU305438")
+    checks.expect("37a 场景前提：多数合成号校验位应为3", greedy_check, 3)
+    status, body = call_consensus(readings)
+    checks.expect("37b 全局最优 200", status, 200)
+    checks.expect("37c 状态 unique", body["status"], "unique")
+    checks.expect("37d 最优号非多数合成号",
+                  body["solutions"][0]["container_number"], "DSQU3054384")
+    checks.expect("37e 最小代价 10", body["minimum_cost"], 10)
+    # “逐位多数 + 修补末位”得到 CSQU3054383，代价 14，严格更差。
+    greedy_cost = sum(
+        a != b for n in readings for a, b in zip("CSQU3054383", n)
+    )
+    checks.expect("37f 贪心多数+补末位代价 14", greedy_cost, 14)
+    checks.check(
+        "37g 全局代价严格优于贪心修补",
+        body["minimum_cost"] < greedy_cost,
+        f"{body['minimum_cost']} !< {greedy_cost}",
+    )
+    assert_consensus_equals_reference("37h", body, readings)
+
+    # 38. 多个同分最优：精确计数、统一代价、字典序稳定。
+    readings = ["BXWZ6351759", "LWDZ6395759"]
+    status, body = call_consensus(readings)
+    checks.expect("38a 歧义状态 200", status, 200)
+    checks.expect("38b status=multiple", body["status"], "multiple")
+    checks.expect("38c 最小代价 5", body["minimum_cost"], 5)
+    checks.expect("38d 精确解数 4", body["solution_count"], 4)
+    checks.expect("38e 未截断", body["truncated"], False)
+    checks.expect(
+        "38f 字典序解列表",
+        [s["container_number"] for s in body["solutions"]],
+        ["BWDZ6395759", "BXWZ6351759", "LWDZ6395759", "LXWZ6351759"],
+    )
+    checks.check(
+        "38g 返回解代价统一为最小代价",
+        all(s["cost"] == body["minimum_cost"] for s in body["solutions"]),
+        str(body["solutions"]),
+    )
+    assert_consensus_equals_reference("38h", body, readings)
+
+    # 39. 超过 100 个同分最优：计数精确（180）、只返回字典序前 100、
+    # 截断标记为真。两读数 11 位全异，2**11 组合中恰 180 个合法。
+    readings = ["RNBZ1390991", "MBHU8246287"]
+    status, body = call_consensus(readings)
+    checks.expect("39a 大规模歧义 200", status, 200)
+    checks.expect("39b 精确最优总数 180", body["solution_count"], 180)
+    checks.expect("39c 截断标记为真", body["truncated"], True)
+    checks.expect("39d 列表恰为 100", len(body["solutions"]), 100)
+    numbers = [s["container_number"] for s in body["solutions"]]
+    checks.expect("39e 列表按字典序", numbers, sorted(numbers))
+    checks.expect("39f 字典序首个", numbers[0], "MBBU1290291")
+    reference = reference_consensus(readings)
+    checks.expect("39g 前100与暴力参考一致", numbers, reference[1][:100])
+    checks.check(
+        "39h 第101个同分解未被列出",
+        reference[1][100] not in numbers,
+        reference[1][100],
+    )
+
+    # 40. 重复读数参与计票：单条偏差对四条一致读数，真实号以代价 2
+    # 胜出（两条箱号在顺序号末位与校验位两处不同）。
+    base = make_valid("MSCU635589")  # MSCU6355895
+    other = make_valid("MSCU635580")  # MSCU6355806
+    readings = [base] * 4 + [other]
+    status, body = call_consensus(readings)
+    checks.expect("40a 重复计票 200", status, 200)
+    checks.expect("40b 多数读数号胜出",
+                  body["solutions"][0]["container_number"], base)
+    checks.expect("40c 最小代价 2", body["minimum_cost"], 2)
+
+    # 41. 两类无解边界与“非法字符只计不一致、不进候选域”。
+    # 边界一：某位置无合法观测（首位只见小写字母）。
+    status, body = call_consensus(["csqu3054383", "bsqu3054383"])
+    checks.expect("41a 无合法观测 200", status, 200)
+    checks.expect("41b 状态 not_found", body["status"], "not_found")
+    checks.expect("41c 代价为空", body["minimum_cost"], None)
+    checks.expect("41d 解数 0", body["solution_count"], 0)
+    checks.expect("41e 列表空", body["solutions"], [])
+    checks.expect("41f 不截断", body["truncated"], False)
+    # 边界一变体：末位（校验位）只见非法字符。
+    status, body = call_consensus(["CSQU305438X", "CSQU305438Y"])
+    checks.expect("41g 末位无合法观测无解", body["status"], "not_found")
+    checks.expect("41h 末位无解代价为空", body["minimum_cost"], None)
+    # 边界二：各位置均有合法候选，但候选域拼不出满足校验位的组合
+    # （前缀唯一 CSQU305438 期望末位 3，末位只见 1）。
+    readings = ["CSQU3054381", "CSQU3054381"]
+    status, body = call_consensus(readings)
+    checks.expect("41i 无校验位组合 200", status, 200)
+    checks.expect("41j 状态 not_found", body["status"], "not_found")
+    checks.expect("41k 代价为空", body["minimum_cost"], None)
+    assert_consensus_equals_reference("41l", body, readings)
+    # 非法字符不进候选域：c 只见于首位，候选首位仅有 C；两条非法
+    # 读数在首位各计一次不一致，总代价 2。
+    readings = ["CSQU3054383", "CSQU3054383", "cSQU3054383", "cSQU3054383"]
+    status, body = call_consensus(readings)
+    checks.expect("41m 非法观测仍有解 200", status, 200)
+    checks.expect("41n 唯一解为合法号",
+                  body["solutions"][0]["container_number"], "CSQU3054383")
+    checks.expect("41o 非法字符贡献代价 2", body["minimum_cost"], 2)
+    assert_consensus_equals_reference("41p", body, readings)
+
+    # 42. 请求形状：数量越界、长度非 11、缺字段、非字符串、多余字段
+    # 一律标准 422 detail；边界 2 与 100 接受。
+    for label, payload in [
+        ("42a 仅1条", {"container_numbers": ["CSQU3054383"]}),
+        ("42b 空批", {"container_numbers": []}),
+        ("42c 超100", {"container_numbers": ["CSQU3054383"] * 101}),
+        ("42d 元素10位", {"container_numbers": ["CSQU3054383", "CSQU305438"]}),
+        ("42e 元素12位", {"container_numbers": ["CSQU3054383", "CSQU30543834"]}),
+        ("42f 元素非字符串", {"container_numbers": ["CSQU3054383", 12345678901]}),
+        ("42g 顶层非数组", {"container_numbers": "CSQU3054383"}),
+        ("42h 缺字段", {}),
+        (
+            "42i 多余字段",
+            {"container_numbers": ["CSQU3054383"] * 2, "normalize": True},
+        ),
+    ]:
+        status, body = call_consensus_payload(payload)
+        checks.expect(f"{label} 422", status, 422)
+        checks.check(f"{label} detail 形态", "detail" in body, str(body))
+
+    status, body = call_consensus(["CSQU3054383"] * 2)
+    checks.expect("42j 下界2条 200", status, 200)
+    checks.expect("42k 下界读数计数", body["reading_count"], 2)
+    status, body = call_consensus(["CSQU3054383"] * 100)
+    checks.expect("42l 上界100条 200", status, 200)
+    checks.expect("42m 上界零代价", body["minimum_cost"], 0)
+
+    # 43. 未配对代理字符：只计不一致、不进候选域；响应不以 500 中断。
+    surrogate = "\ud800SQU3054383"  # 恰 11 位，首位为未配对高代理字符
+    status, body = call_consensus([surrogate, surrogate])
+    checks.expect("43a 代理字符无合法观测 200", status, 200)
+    checks.expect("43b 无解", body["status"], "not_found")
+    status, body = call_consensus([surrogate, "CSQU3054383"])
+    checks.expect("43c 混合正常读数 200", status, 200)
+    checks.expect("43d 唯一解", body["status"], "unique")
+    checks.expect("43e 解为正常号",
+                  body["solutions"][0]["container_number"], "CSQU3054383")
+    checks.expect("43f 代理读数贡献代价 1", body["minimum_cost"], 1)
 
     return _report(checks)
 

@@ -6,7 +6,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from app.checksum import CONTAINER_LENGTH
+from app.checksum import (
+    CONSENSUS_MAX_READINGS,
+    CONSENSUS_MIN_READINGS,
+    CONTAINER_LENGTH,
+)
 
 MIN_BATCH = 1
 MAX_BATCH = 100
@@ -376,4 +380,100 @@ class ReconcileInvalidItemResponse(BaseModel):
     )
     passed: Literal[False] = Field(
         ..., description="原校验结论：无效项恒为 false"
+    )
+
+
+# --------------------------------------------------------------- 多读数共识
+
+
+class ConsensusRequest(BaseModel):
+    """多读数共识请求：2..100 条原始读数，原样传递，不做任何归一化。
+
+    每条读数必须恰为 11 个字符；读数内部允许含非法字符（小写、越域
+    字符等），它们在领域层只计逐位不一致、不进入候选域。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 列表长度直接用 min_length/max_length 约束（与批量校验一致）；
+    # 元素不使用带 min_length 的字符串约束：pydantic-core 对带约束的
+    # 字符串会先做 Unicode 标量转换，把含未配对代理字符（如首位为
+    # \ud800）的 11 位读数误判为 string_unicode，使其无法进入领域层。
+    # 恰为 11 位的逐元素检查改由下方的 Python 校验器完成，错误形态
+    # 仍是请求校验 422（detail 数组）。
+    container_numbers: list[str] = Field(
+        ...,
+        min_length=CONSENSUS_MIN_READINGS,
+        max_length=CONSENSUS_MAX_READINGS,
+        description=(
+            "同一箱体的 2 至 100 条原始 OCR 读数（含端点）。每条必须恰为 "
+            "11 个字符；字符串原样使用，不进行大小写或空白归一化。"
+            "重复读数参与计票，非法字符只计不一致且不进入候选域。"
+        ),
+    )
+
+    @field_validator("container_numbers")
+    @classmethod
+    def _each_reading_exactly_eleven_characters(
+        cls, value: list[str]
+    ) -> list[str]:
+        for index, reading in enumerate(value):
+            if len(reading) != CONTAINER_LENGTH:
+                raise ValueError(
+                    f"container_numbers[{index}] must be exactly "
+                    f"{CONTAINER_LENGTH} characters, got {len(reading)}"
+                )
+        return value
+
+
+class ConsensusSolutionOut(BaseModel):
+    """一个并列最优的共识解。"""
+
+    container_number: str = Field(
+        ..., description="完整合法箱号（结构合法且校验位通过）"
+    )
+    cost: int = Field(
+        ...,
+        description=(
+            "该解对全部读数的逐位不一致总数（含非法观测；所有返回解"
+            "代价相同，即最小代价）"
+        ),
+    )
+
+
+class ConsensusResponse(BaseModel):
+    """多读数共识结论：确定（unique）、歧义（multiple）或无解（not_found）。
+
+    ``minimum_cost`` 为候选合法箱号对全部读数的逐位不一致总数的全局
+    最小值；无解时为 ``null``。``solution_count`` 是达到最小代价的
+    解的精确总数（可能超过 100）；``solutions`` 只承载按完整箱号
+    字典序排列的前 100 个解，``truncated`` 为 ``true`` 表示其后仍有
+    同分最优解未列出。
+    """
+
+    status: Literal["unique", "multiple", "not_found"] = Field(
+        ...,
+        description=(
+            "unique=唯一确定解；multiple=多个并列最优解（歧义）；"
+            "not_found=无满足校验位的合法组合"
+        ),
+    )
+    reading_count: int = Field(..., description="参与共识的原始读数条数")
+    minimum_cost: int | None = Field(
+        ...,
+        description=(
+            "最优解对全部读数的逐位不一致总数；无解时为 null"
+        ),
+    )
+    solution_count: int = Field(
+        ..., description="达到最小代价的合法箱号精确总数（可能大于 100）"
+    )
+    truncated: bool = Field(
+        ..., description="solutions 是否因超过 100 个而同分最优被截断"
+    )
+    solutions: list[ConsensusSolutionOut] = Field(
+        ...,
+        description=(
+            "按完整箱号字典序排列的前 100 个最优解；无解时为空列表"
+        ),
     )
